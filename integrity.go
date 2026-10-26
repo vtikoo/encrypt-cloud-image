@@ -24,7 +24,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
+
+	"golang.org/x/sys/unix"
 
 	internal_exec "github.com/canonical/encrypt-cloud-image/internal/exec"
 	"github.com/canonical/encrypt-cloud-image/internal/fs"
@@ -78,6 +83,10 @@ type imageIntegrityProtector struct {
 func (i *imageIntegrityProtector) prepareRootPartition() error {
 	devPath := i.rootDevPath()
 
+	if err := checkIntegrityExtFS(devPath); err != nil {
+		return err
+	}
+
 	log.Infoln("shrinking fileystem on", devPath)
 	if err := shrinkExtFS(devPath); err != nil {
 		return fmt.Errorf("cannot shrink filesystem: %w", err)
@@ -86,9 +95,7 @@ func (i *imageIntegrityProtector) prepareRootPartition() error {
 	// If the image has been booted before, filesystem errors that will
 	// be corrected on boot might cause verity errors.
 	log.Infoln("running checks on", devPath)
-	cmd := internal_exec.LoggedCommand("fsck", "-p", devPath)
-
-	if err := cmd.Run(); err != nil {
+	if err := checkIntegrityExtFS(devPath); err != nil {
 		return err
 	}
 
@@ -102,20 +109,36 @@ func (i *imageIntegrityProtector) prepareRootPartition() error {
 	endingLBA := uint64(i.rootPartition.StartingLBA) + sectorsFromBlocks(fsBlockCount, fsBlockSize) - 1
 
 	action := func() error {
-		cmd = internal_exec.LoggedCommand("sgdisk",
+		cmd := internal_exec.LoggedCommand("sgdisk",
 			i.imagePath,
 			"--delete",
-			fmt.Sprintf("%d", 1),
+			fmt.Sprintf("%d", i.rootPartition.Index),
 			"--new",
-			fmt.Sprintf("%d:%d:%d", 1, i.rootPartition.StartingLBA, endingLBA),
+			fmt.Sprintf("%d:%d:%d", i.rootPartition.Index, i.rootPartition.StartingLBA, endingLBA),
+			"--partition-guid",
+			fmt.Sprintf("%d:%s", i.rootPartition.Index, i.rootPartition.UniquePartitionGUID),
+			"--typecode",
+			fmt.Sprintf("%d:%s", i.rootPartition.Index, i.rootPartition.PartitionTypeGUID),
 			"--change-name",
-			fmt.Sprintf("%d:%s", 1, "cloudimg-rootfs"),
+			fmt.Sprintf("%d:%s", i.rootPartition.Index, "cloudimg-rootfs"),
 		)
 
 		return cmd.Run()
 	}
 
-	return i.repartition(action)
+	if err := i.repartition(action); err != nil {
+		return err
+	}
+	return i.syncIntegrityPartitionNodes()
+}
+
+func checkIntegrityExtFS(path string) error {
+	err := internal_exec.LoggedCommand("e2fsck", "-p", "-f", path).Run()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return nil
+	}
+	return err
 }
 
 func (i *imageIntegrityProtector) createIntegrityDataForRootPartition() (string, string, error) {
@@ -131,6 +154,14 @@ func (i *imageIntegrityProtector) createIntegrityDataForRootPartition() (string,
 }
 
 func (i *imageIntegrityProtector) createVerityPartition(size uint64) error {
+	for _, partition := range i.partitions {
+		if partition.Index == verityPartitionNum && partition != i.verity {
+			return fmt.Errorf("refusing to replace occupied partition %d", verityPartitionNum)
+		}
+	}
+	if i.verity != nil && i.verity.Index != verityPartitionNum {
+		return fmt.Errorf("existing verity partition must have index %d", verityPartitionNum)
+	}
 	action := func() error {
 		if i.verity != nil {
 			log.Infoln("deleting existing verity partition")
@@ -155,7 +186,7 @@ func (i *imageIntegrityProtector) createVerityPartition(size uint64) error {
 			i.imagePath,
 			"--move-second-header",
 			"--new",
-			fmt.Sprintf("%d:%d:+%dK", verityPartitionNum, verityPartitionStart, size/1024),
+			fmt.Sprintf("%d:%d:+%d", verityPartitionNum, verityPartitionStart, (size+gpt.BlockSize-1)/gpt.BlockSize),
 			"--typecode",
 			fmt.Sprintf("%d:%s", verityPartitionNum, rootVerityPartitionAmd64GUID),
 			"--change-name",
@@ -169,7 +200,10 @@ func (i *imageIntegrityProtector) createVerityPartition(size uint64) error {
 		return nil
 	}
 
-	return i.repartition(action)
+	if err := i.repartition(action); err != nil {
+		return err
+	}
+	return i.syncIntegrityPartitionNodes()
 }
 
 func (i *imageIntegrityProtector) createOrUpdateVerityPartition(verityFilePath string) error {
@@ -181,9 +215,7 @@ func (i *imageIntegrityProtector) createOrUpdateVerityPartition(verityFilePath s
 
 	create := true
 	if i.verity != nil {
-		partitionSize := uint64(i.verity.EndingLBA - i.verity.StartingLBA)
-
-		if partitionSize >= veritySize {
+		if verityPartitionFits(i.verity, veritySize) {
 			create = false
 		}
 	}
@@ -199,6 +231,7 @@ func (i *imageIntegrityProtector) createOrUpdateVerityPartition(verityFilePath s
 	cmd := internal_exec.LoggedCommand("dd",
 		"if="+verityFilePath,
 		"of="+i.verityDevPath(),
+		"conv=nocreat",
 	)
 
 	if err := cmd.Run(); err != nil {
@@ -208,15 +241,67 @@ func (i *imageIntegrityProtector) createOrUpdateVerityPartition(verityFilePath s
 	return nil
 }
 
+func verityPartitionFits(partition *gpt.PartitionEntry, size uint64) bool {
+	if partition.EndingLBA < partition.StartingLBA {
+		return false
+	}
+	return uint64(partition.EndingLBA-partition.StartingLBA+1)*gpt.BlockSize >= size
+}
+
 // These match the structs in snap-bootstrap
 type ImageManifestPartition struct {
 	GptLabel string `json:"label"`
 	RootHash string `json:"root_hash"`
-	Overlay  string `json:"overlay"`
+	ReadOnly bool   `json:"read_only"`
 }
 
 type ImageManifest struct {
 	Partitions []ImageManifestPartition `json:"partitions"`
+}
+
+func (i *imageIntegrityProtector) syncIntegrityPartitionNodes() error {
+	if err := internal_exec.LoggedCommand("blockdev", "--rereadpt", i.devPath).Run(); err != nil {
+		return fmt.Errorf("cannot refresh integrity-image partition nodes: %w", err)
+	}
+	if err := internal_exec.LoggedCommand("udevadm", "settle").Run(); err != nil {
+		return err
+	}
+	for _, partition := range i.partitions {
+		devicePath := i.getDevPath(partition.Index)
+		path := filepath.Join("/sys/class/block", filepath.Base(devicePath))
+		var stat unix.Stat_t
+		if err := unix.Stat(devicePath, &stat); err != nil {
+			return err
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFBLK {
+			return fmt.Errorf("%s is not a block device", devicePath)
+		}
+		expectedDevice, err := os.ReadFile(filepath.Join(path, "dev"))
+		if err != nil {
+			return err
+		}
+		actualDevice := fmt.Sprintf("%d:%d", unix.Major(uint64(stat.Rdev)), unix.Minor(uint64(stat.Rdev)))
+		if actualDevice != strings.TrimSpace(string(expectedDevice)) {
+			return fmt.Errorf("%s does not match its kernel block-device identity", devicePath)
+		}
+		for name, expected := range map[string]uint64{
+			"start": uint64(partition.StartingLBA),
+			"size":  uint64(partition.EndingLBA - partition.StartingLBA + 1),
+		} {
+			data, err := os.ReadFile(filepath.Join(path, name))
+			if err != nil {
+				return err
+			}
+			actual, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+			if err != nil {
+				return err
+			}
+			if actual != expected {
+				return fmt.Errorf("partition %d %s is %d sectors, GPT requires %d", partition.Index, name, actual, expected)
+			}
+		}
+	}
+	return nil
 }
 
 func (i *imageIntegrityProtector) integrityProtectImageOnDevice() error {
@@ -228,6 +313,9 @@ func (i *imageIntegrityProtector) integrityProtectImageOnDevice() error {
 	defer i.exitScope()
 
 	if err := i.detectPartitions(); err != nil {
+		return err
+	}
+	if err := i.syncIntegrityPartitionNodes(); err != nil {
 		return err
 	}
 
@@ -251,7 +339,7 @@ func (i *imageIntegrityProtector) integrityProtectImageOnDevice() error {
 	partition := ImageManifestPartition{
 		GptLabel: "cloudimg-rootfs",
 		RootHash: rootHash,
-		Overlay:  "lowerdir",
+		ReadOnly: true,
 	}
 
 	im := &ImageManifest{
@@ -315,11 +403,12 @@ func (i *imageIntegrityProtector) setupWorkingDir() error {
 	return i.encryptCloudImageBase.setupWorkingDir(baseDir)
 }
 
-func (i *imageIntegrityProtector) run(opts *integrityOptions) error {
+func (i *imageIntegrityProtector) run(opts *integrityOptions) (err error) {
 	i.opts = opts
 
 	i.enterScope()
 	defer i.exitScope()
+	defer func() { i.failed = err != nil }()
 
 	inputIsBlockDevice, err := fs.PathIsBlockDevice(opts.Positional.Input)
 	if err != nil {
@@ -328,6 +417,9 @@ func (i *imageIntegrityProtector) run(opts *integrityOptions) error {
 
 	if opts.Output != "" && inputIsBlockDevice {
 		return errors.New("cannot specify --output with a block device")
+	}
+	if inputIsBlockDevice {
+		return errors.New("integrity-protect requires a disposable image file; block-device repartitioning is unsupported")
 	}
 
 	if err := i.setupWorkingDir(); err != nil {
